@@ -1,0 +1,61 @@
+# Bake and publish to Hugging Face (bake.py, publish.py). Manual only in the template: add a schedule in your copy, e.g.
+#   schedule:
+#     - cron: '30 19 * * *'          # 03:30 HKT daily
+# Each run commits status/last-run.json: GitHub turns schedules off after 60 days with no commits.
+name: bake
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Publish even if the publish gate finds a count drop (a real drop, checked by hand)'
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: bake
+  cancel-in-progress: false
+jobs:
+  bake:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PIPELINE_DATA: ${{ github.workspace }}/data
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
+        with:
+          python-version: '3.14'
+          cache: pip
+      - run: pip install -r requirements.txt
+      # downloads kept between runs (restore and save are split so the cache is saved even when publish fails)
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: data/cache
+          key: cache-${{ github.run_id }}
+          restore-keys: cache-
+      - name: bake
+        run: python bake.py
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        if: always()
+        with:
+          path: data/cache
+          key: cache-${{ github.run_id }}
+      - name: publish
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          PUBLISH_FORCE: ${{ inputs.force && '1' || '0' }}
+        run: set -o pipefail; mkdir -p status && python publish.py | tee status/last-run.json   # git keeps no empty folder: mkdir first
+      # Kaggle mirror of everything published (Helen's account). Its own step, allowed to fail: never blocks Hugging Face.
+      - name: mirror to Kaggle
+        continue-on-error: true
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: python kaggle_mirror.py
+      - name: keep-alive commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add status/last-run.json
+          git commit -m "bake $(date -u +%F)" || exit 0
+          git pull --rebase -q && git push   # main may have moved during the run
