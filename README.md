@@ -7,14 +7,14 @@ plus index). Data: adsb.lol contributors, ODbL 1.0.
 
 | File | Does |
 |---|---|
-| `bake.py` | Latest `planes-readsb-prod-0` release of `adsblol/globe_history_<year>`: streams the split tar (curl into `tarfile`), one NDJSON batch of about 1 GB at a time into DuckDB (6 GB memory cap), writes `v/<D>/traces-NNN.parquet` and `v/<D>/replay.bin`, then `index.json` (all days, read back from the bucket) and `latest.json`. `python3 bake.py <tag>` bakes another release, e.g. a small `...-mlatonly-0` for a local test |
+| `bake.py` | Latest `planes-readsb-prod-0` release of `adsblol/globe_history_<year>`: streams the split tar (curl into `tarfile`), one NDJSON batch of about 1 GB at a time into DuckDB (6 GB memory cap), writes `v/<D>/traces-NNN.parquet`, hourly `v/<D>/replay/HH.bin`, `v/<D>/acas.parquet` and the release's other files as delivered in `v/<D>/raw/`, then `index.json` (all days, read back from the bucket) and `latest.json`. `python3 bake.py <tag>` bakes another release, e.g. a small `...-mlatonly-0` for a local test |
 | `publish.py` | The new day to the dataset (one commit) and the bucket; days older than the newest 30 leave the bucket only |
 | `live.py`, `live.yml` | Every 15 minutes: one API call (250 nm around Hong Kong), `live/hk.json` and `live/hk-<UTC day>.parquet` on the bucket; a 429 or error skips the run |
 | `bake.yml` | Daily at 04:30 UTC (adsb.lol publishes about 03:26 UTC); frees runner disk first |
 
 Measured on 2026-10-09 data: the mlat-only release (42,187 aircraft, 10.1M points) bakes in 20 s locally; the first 300 MB of
 the prod release held 7,847 aircraft and 10.6M points (442 MB Parquet). A full prod day is about 4.1 GB of tar, ~26 GB of JSON,
-~150M points, ~6 GB of Parquet and ~0.7 GB of replay (estimates scaled from that sample).
+~150M points, ~6 GB of Parquet, ~1 GB of raw heatmap and ~0.7 GB of replay: about 8 GB a day (estimates scaled from that sample).
 
 Built from [pipeline-template](https://github.com/AlreadyOpen/pipeline-template); `manifest.py`, `check.py`, `check.yml`
 and `kaggle_mirror.py` are its shared files.

@@ -2,11 +2,16 @@
 Source: the GitHub release v<YYYY.MM.DD>-planes-readsb-prod-0 of adsblol/globe_history_<year>: split tar parts (.tar.aa, .ab, ...)
 that concatenate into one tar holding traces/<last 2 hex>/trace_full_<icao>.json (gzip despite the name), one per aircraft.
 Streamed: curl writes the parts in order into Python's tarfile ('r|'), traces go into a batch folder, each batch of BATCH files is
-turned into one Parquet part by DuckDB and deleted, so the disk never holds the day's tar.
+turned into one Parquet part by DuckDB and deleted, so the disk never holds the day's tar. Every other member of the tar (acas/,
+heatmap/, README.txt, licences) is kept as delivered under v/<D>/raw/.
 Outputs (sources.OUT):
   v/<D>/traces-NNN.parquet  GeoParquet, one row per trace point, every field (aircraft fields per row, `details` = readsb's
                             aircraft object as JSON where the point carries one), geometry = POINT(lon lat) EPSG:4326
-  v/<D>/replay.bin          per aircraft, time-ordered, at most one position per 30 s bucket (layout: REPLAY below)
+  v/<D>/replay/HH.bin       one file per UTC hour: per aircraft, time-ordered, at most one position per 30 s bucket (layout:
+                            REPLAY below); replay/index.json lists the hours with their aircraft and point counts
+  v/<D>/acas.parquet        raw/acas/acas.json.gz (one ACAS resolution advisory per line: readsb's aircraft object plus
+                            `acas_ra`) as GeoParquet, every field (`record` = the whole line as JSON)
+  v/<D>/raw/...             the release's non-trace files as delivered (heatmap/NN.bin.ttf is not parsed: see the card)
   index.json                every day baked so far (read back from the bucket), latest.json the newest day
 Usage: python3 bake.py [<release tag>]   (default: the latest prod-0 release; e.g. a ...-mlatonly-0 tag for a small test)"""
 import datetime, gzip, json, os, re, shutil, subprocess, sys, tarfile, urllib.error, urllib.request
@@ -23,7 +28,17 @@ UA = {'User-Agent': 'AlreadyOpen world-flights (https://github.com/AlreadyOpen/w
 REPLAY = """little-endian: b'AOR1', uint32 header length H, H bytes of JSON header (padded to 4), then N values per column in
 header.columns order: t int32 (s after day_start), lon int32 and lat int32 (1e-5 degrees), altitude int32 (ft; -999999 = ground,
 -2147483648 = none), ground_speed int16 (kt; -1 none), track int16 (0.1 degree; -1 none). header.aircraft = [[icao, registration,
-type, first point, point count], ...] in icao order; an aircraft's points are contiguous and time-ordered."""
+type, first point, point count], ...] in icao order; an aircraft's points are contiguous and time-ordered. One file per UTC hour
+(header.hour); an aircraft flying across hours appears in each of them."""
+EXPECTED_DAILY = {'parquet_gb': 6, 'heatmap_raw_gb': 1, 'replay_gb': 0.7, 'note': 'estimate from 2026-10-09 (a ~4.1 GB prod release)'}
+ACAS = """
+SELECT to_timestamp((json->'acas_ra'->>'unix_timestamp')::DOUBLE) AS "time", json->>'hex' AS "hex", json->>'flight' AS "flight",
+  json->>'r' AS "registration", json->>'t' AS "type", (json->>'lat')::DOUBLE AS "lat", (json->>'lon')::DOUBLE AS "lon",
+  json->>'alt_baro' AS "alt_baro", json->'acas_ra'->>'advisory' AS "advisory",
+  json->'acas_ra'->>'advisory_complement' AS "advisory_complement", json->'acas_ra'->>'threat_id_hex' AS "threat_id_hex",
+  json->'acas_ra'->>'full_bytes' AS "full_bytes", json AS "record",
+  CASE WHEN json->>'lat' IS NOT NULL THEN ST_Point((json->>'lon')::DOUBLE, (json->>'lat')::DOUBLE) END AS "geometry"
+FROM read_json_objects('{src}', format='newline_delimited', compression='gzip')"""
 
 
 def api(url):
@@ -84,20 +99,27 @@ def flush(con, batch, n, day_dir, parts):
     os.remove(batch)
 
 
-def write_replay(con, parts, path, day, day_start):
+def write_replay(con, parts, folder, day, day_start):
+    """one replay file per UTC hour of t (30 s buckets never straddle an hour) plus folder/index.json"""
     src = f"read_parquet('{parts}/*.parquet')"
-    ac = con.execute(f'SELECT icao, any_value(registration), any_value("type"), count(*) FROM {src} GROUP BY icao ORDER BY icao').fetchall()
-    first = np.concatenate([[0], np.cumsum([a[3] for a in ac])[:-1]]).tolist()
-    r = con.execute(f'SELECT t, lon, lat, altitude, ground_speed, track FROM {src} ORDER BY icao, t').fetchnumpy()
     cols = [('t', '<i4'), ('lon', '<i4'), ('lat', '<i4'), ('altitude', '<i4'), ('ground_speed', '<i2'), ('track', '<i2')]
-    head = json.dumps({'day': day, 'day_start': day_start, 'step': STEP, 'points': len(r['t']), 'columns': [c for c, _ in cols],
-                       'layout': REPLAY, 'aircraft': [[i, reg, typ, f, c] for (i, reg, typ, c), f in zip(ac, first)]},
-                      separators=(',', ':')).encode()
-    head += b' ' * (-len(head) % 4)
-    with open(path, 'wb') as f:
-        f.write(b'AOR1' + np.uint32(len(head)).tobytes() + head)
-        for c, t in cols: f.write(np.asarray(r[c]).astype(t).tobytes())
-    return len(r['t'])
+    hours = []
+    for h, in con.execute(f'SELECT DISTINCT t // 3600 FROM {src} ORDER BY 1').fetchall():
+        w = f'{src} WHERE t // 3600 = {h}'
+        ac = con.execute(f'SELECT icao, any_value(registration), any_value("type"), count(*) FROM {w} GROUP BY icao ORDER BY icao').fetchall()
+        first = np.concatenate([[0], np.cumsum([a[3] for a in ac])[:-1]]).tolist()
+        r = con.execute(f'SELECT t, lon, lat, altitude, ground_speed, track FROM {w} ORDER BY icao, t').fetchnumpy()
+        head = json.dumps({'day': day, 'day_start': day_start, 'hour': h, 'step': STEP, 'points': len(r['t']),
+                           'columns': [c for c, _ in cols], 'layout': REPLAY,
+                           'aircraft': [[i, reg, typ, f, c] for (i, reg, typ, c), f in zip(ac, first)]}, separators=(',', ':')).encode()
+        head += b' ' * (-len(head) % 4)
+        name = f'{h:02d}.bin'
+        with open(os.path.join(folder, name), 'wb') as f:
+            f.write(b'AOR1' + np.uint32(len(head)).tobytes() + head)
+            for c, t in cols: f.write(np.asarray(r[c]).astype(t).tobytes())
+        hours.append({'hour': h, 'file': name, 'aircraft': len(ac), 'points': len(r['t']), 'bytes': os.path.getsize(os.path.join(folder, name))})
+    json.dump({'day': day, 'day_start': day_start, 'step': STEP, 'layout': REPLAY, 'hours': hours}, open(os.path.join(folder, 'index.json'), 'w'), indent=1)
+    return sum(x['points'] for x in hours)
 
 
 def main(tag=None):
@@ -111,13 +133,20 @@ def main(tag=None):
     folder, parts = os.path.join(work, 'batch.ndjson'), os.path.join(work, 'replay')
     shutil.rmtree(day_dir, ignore_errors=True); shutil.rmtree(work, ignore_errors=True)
     for d in (day_dir, parts): os.makedirs(d)
+    day_dir = os.path.abspath(day_dir)
     con = duckdb.connect(os.path.join(work, 'spill.duckdb'))
     con.execute(f"LOAD spatial; SET memory_limit='6GB'; SET threads=4; SET temp_directory='{work}/tmp'; SET preserve_insertion_order=false")
     curl = subprocess.Popen(['curl', '-sSfL', '--retry', '3', *urls], stdout=subprocess.PIPE)
     n = files = 0; batch = open(folder, 'wb')
     with tarfile.open(fileobj=curl.stdout, mode='r|') as tar:            # one trace per line: DuckDB reads lines in bounded memory
         for m in tar:
-            if not (m.isfile() and re.fullmatch(r'(\./)?traces/[0-9a-f]{2}/trace_full_[^/]+\.json', m.name)): continue
+            if not m.isfile(): continue
+            if not re.fullmatch(r'(\./)?traces/[0-9a-f]{2}/trace_full_[^/]+\.json', m.name):   # acas, heatmap, README, licences
+                rel_name = os.path.normpath(m.name); assert not rel_name.startswith(('..', '/')), m.name
+                dst = os.path.join(day_dir, 'raw', rel_name)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(dst, 'wb') as f: shutil.copyfileobj(tar.extractfile(m), f)
+                continue
             batch.write(gzip.decompress(tar.extractfile(m).read()).replace(b'\n', b'') + b'\n')   # raw newlines only between tokens
             files += 1
             if batch.tell() >= BATCH:
@@ -128,13 +157,18 @@ def main(tag=None):
     aircraft, points = con.execute(f"SELECT count(DISTINCT icao), count(*) FROM read_parquet('{day_dir}/traces-*.parquet')").fetchone()
     assert aircraft == files, f'{files} trace files but {aircraft} aircraft'
     day_start = int(con.execute(f"SELECT min(day_start) FROM read_parquet('{day_dir}/traces-*.parquet')").fetchone()[0])
-    replay_points = write_replay(con, parts, os.path.join(day_dir, 'replay.bin'), day, day_start)
+    os.makedirs(os.path.join(day_dir, 'replay'))
+    replay_points = write_replay(con, parts, os.path.join(day_dir, 'replay'), day, day_start)
+    acas = os.path.join(day_dir, 'raw', 'acas', 'acas.json.gz'); acas_events = 0
+    if os.path.exists(acas) and os.path.getsize(acas) > 20:                  # an empty gzip is 20 bytes (the mlat-only release)
+        con.execute(f"COPY ({ACAS.format(src=acas)} ORDER BY 1) TO '{day_dir}/acas.parquet' (FORMAT parquet, COMPRESSION zstd)")
+        acas_events = con.execute(f"SELECT count(*) FROM '{day_dir}/acas.parquet'").fetchone()[0]
     con.close(); shutil.rmtree(work)
     prev = [d for d in idx['days'] if d['day'] < day]
     if prev and tag.endswith('-prod-0') and points < prev[-1]['points'] * 0.5:
         sys.exit(f'{day}: {points} points, under half of {prev[-1]["day"]} ({prev[-1]["points"]}): a broken release?')
-    names = sorted(os.listdir(day_dir))
-    entry = {'day': day, 'release': tag, 'source': urls, 'aircraft': aircraft, 'points': points, 'replay_points': replay_points,
+    names = sorted(os.path.relpath(os.path.join(r, f), day_dir) for r, _, fs in os.walk(day_dir) for f in fs)
+    entry = {'day': day, 'release': tag, 'source': urls, 'aircraft': aircraft, 'points': points, 'replay_points': replay_points, 'acas_events': acas_events,
              'files': names, 'bytes': sum(os.path.getsize(os.path.join(day_dir, f)) for f in names),
              'dataset': [DS + f'{rel}/{f}' for f in names], 'bucket': [BK + f'{rel}/{f}' for f in names]}
     days = sorted([d for d in idx['days'] if d['day'] != day] + [entry], key=lambda d: d['day'])
@@ -144,11 +178,11 @@ def main(tag=None):
     new = [f'{rel}/{f}' for f in names]
     idx = {'built': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
            'counts': {'days': len(days), 'aircraft': sum(d['aircraft'] for d in days), 'points': sum(d['points'] for d in days)},
-           'licence': 'ODbL 1.0, adsb.lol contributors', 'replay_layout': REPLAY, 'days': days, 'new': new, 'bucket_drop': dropped}
+           'licence': 'ODbL 1.0, adsb.lol contributors', 'expected_daily_volume': EXPECTED_DAILY, 'replay_layout': REPLAY, 'days': days, 'new': new, 'bucket_drop': dropped}
     json.dump(idx, open(os.path.join(sources.OUT, 'index.json'), 'w'), indent=1)
-    json.dump({k: entry[k] for k in ('day', 'aircraft', 'points', 'replay_points', 'dataset', 'bucket')} | {'index': BK + 'index.json'},
+    json.dump({k: entry[k] for k in ('day', 'aircraft', 'points', 'replay_points', 'acas_events', 'dataset', 'bucket')} | {'index': BK + 'index.json'},
               open(os.path.join(sources.OUT, 'latest.json'), 'w'), indent=1)
-    print(json.dumps({'day': day, 'aircraft': aircraft, 'points': points, 'replay_points': replay_points, 'bytes': entry['bytes']}))
+    print(json.dumps({'day': day, 'aircraft': aircraft, 'points': points, 'replay_points': replay_points, 'acas_events': acas_events, 'bytes': entry['bytes']}))
 
 
 if __name__ == '__main__':

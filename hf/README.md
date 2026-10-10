@@ -30,13 +30,26 @@ publishes the previous UTC day (about 03:26 UTC); the Hong Kong snapshot runs ev
     geometric, 8 altitude is geometric), `vert_rate` (ft/min), `details` (readsb's full aircraft object as JSON, present when
     it changed: flight, squawk, category, nav_*, nic/nac/sil, wind, temperatures, ...), `source` (`adsb_icao`, `mlat`,
     `tisb_*`, `adsr_*`, ...), `alt_geom`, `geom_rate`, `ias`, `roll`
-- `v/<YYYY-MM-DD>/replay.bin`: the same day for a map that replays it in a browser. **Downsampled: per aircraft, only the first
-  position in each 30-second bucket is kept**, and only `t`, `lon`, `lat`, `altitude`, `ground_speed` and `track` (rounded:
-  1e-5 degree, whole feet, whole knots, 0.1 degree). Everything else is in the Parquet, which is complete. Layout (no
-  library needed: `DataView` and typed arrays): `AOR1`, a uint32 header length, a JSON header (`aircraft`:
-  `[icao, registration, type, first point, count]` in icao order, `columns`, `layout`), then one little-endian column after
-  another: `t` int32, `lon` int32, `lat` int32, `altitude` int32 (-999999 ground, -2147483648 unknown), `ground_speed` int16 and
-  `track` int16 (-1 unknown). An aircraft's points are contiguous and time-ordered.
+- `v/<YYYY-MM-DD>/replay/HH.bin` (one file per UTC hour, so a browser loads one hour at a time) and `replay/index.json`
+  (hours with their aircraft and point counts and file sizes): the same day for a map that replays it. **Downsampled: per
+  aircraft, only the first position in each 30-second bucket is kept**, and only `t`, `lon`, `lat`, `altitude`,
+  `ground_speed` and `track` (rounded: 1e-5 degree, whole feet, whole knots, 0.1 degree). Everything else is in the Parquet,
+  which is complete. An aircraft flying across hours appears in each hour's file; hour `24` holds the few points readsb logged
+  just after midnight. Layout (no library needed: `DataView` and typed arrays): `AOR1`, a uint32 header length, a JSON header
+  (`hour`, `aircraft`: `[icao, registration, type, first point, count]` in icao order, `columns`, `layout`), then one
+  little-endian column after another: `t` int32, `lon` int32, `lat` int32, `altitude` int32 (-999999 ground, -2147483648
+  unknown), `ground_speed` int16 and `track` int16 (-1 unknown). An aircraft's points are contiguous and time-ordered.
+- `v/<YYYY-MM-DD>/raw/`: **every other file of the release, as delivered**: `acas/acas.json.gz`, `acas/acas.csv.gz`,
+  `heatmap/NN.bin.ttf` (48 half-hour files), `README.txt`, `LICENSE-ODbL.txt`, `LICENSE-cc0.txt`.
+- `v/<YYYY-MM-DD>/acas.parquet`: GeoParquet of `raw/acas/acas.json.gz`, one row per ACAS/TCAS resolution advisory message
+  (8,391 on 2026-10-09), every field: `record` is the whole line (readsb's aircraft object plus `acas_ra` with time, advisory,
+  ARA/RAT/MTE/RAC, threat id and the raw message bytes), with `time`, `hex`, `flight`, `registration`, `type`, `lat`, `lon`,
+  `alt_baro`, `advisory`, `advisory_complement`, `threat_id_hex` and `full_bytes` as columns. `acas.csv.gz` holds the same
+  events in a shorter, headerless text form; it is kept as delivered and not parsed separately.
+- **The heatmap files are not parsed.** They are readsb's binary heatmap (gzip, then little-endian int32 records of 16 bytes:
+  10-second slice markers, positions and callsign/squawk records). The format is defined only by readsb's and tar1090's source
+  code, not documented, so this dataset keeps the originals rather than guess at fields. The trace Parquet holds the same
+  positions at full resolution.
 - `index.json`: every day baked, with aircraft and point counts, file names and URLs (dataset for all days; bucket while the day
   is among the newest 30). `latest.json`: the newest day.
 - `live/hk-YYYY-MM-DD.parquet` (UTC day): GeoParquet, one row per aircraft per snapshot of the adsb.lol API within 250 nm of
@@ -46,8 +59,13 @@ publishes the previous UTC day (about 03:26 UTC); the Hong Kong snapshot runs ev
 
 The **bucket** (`huggingface.co/buckets/alreadyopen/world-flights`, CORS and HTTP Range) keeps the newest 30 days; this
 **dataset** keeps every day (each bake is a commit) and nothing is deleted from it. The **Kaggle** copy
-(`helenkwok/world-flights`) holds only the latest day plus `index.json`: one day is about 6 GB, so mirroring every day there
-would not be sensible. Use `index.json` for older days.
+(`helenkwok/world-flights`) holds only the latest day plus `index.json`: one day is about 8 GB, so mirroring every day there
+would not be sensible. Use `index.json` for older days. Kaggle stores `.gz` files decompressed, so the Kaggle copies of
+`raw/acas/*.gz` differ in name and sha256 from `manifest.json`.
+
+**Expected volume** (estimate from 2026-10-09, a 4.1 GB release; also in `index.json` `expected_daily_volume`): about
+**6 GB of trace Parquet per day**, plus about 1 GB of raw heatmap files and 0.7 GB of replay files, so roughly 8 GB per day
+and 240 GB per 30 days on the bucket; the dataset grows by that much every day, without limit.
 
 ## Source and licence
 
