@@ -1,0 +1,27 @@
+# Hong Kong near-live snapshot (live.py): one adsb.lol API call per run. On a 429 or any error the run is skipped (exit 0 with a
+# warning), never retried in a loop. GitHub may start a scheduled run late or drop one under load; the archive has gaps then.
+name: live
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: live
+  cancel-in-progress: false
+jobs:
+  live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
+        with:
+          python-version: '3.14'
+          cache: pip
+      - run: pip install duckdb==1.4.5 huggingface_hub==1.12.0
+      - name: snapshot
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python live.py

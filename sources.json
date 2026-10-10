@@ -1,3 +1,4 @@
 [
- {"name": "Example dataset (replace)", "owner": "Example Owner", "url": "https://example.org/data.csv", "licence": "https://example.org/terms", "used_by": "bake.py"}
+ {"name": "adsb.lol globe history (readsb traces, daily)", "owner": "adsb.lol contributors", "url": "https://github.com/adsblol/globe_history_2026/releases", "licence": "https://opendatacommons.org/licenses/odbl/1-0/", "docs": "https://www.adsb.lol/docs/open-data/historical/", "used_by": "bake.py"},
+ {"name": "adsb.lol API, aircraft within 250 nm of Hong Kong", "owner": "adsb.lol contributors", "url": "https://api.adsb.lol/v2/point/22.3/114.2/250", "licence": "https://opendatacommons.org/licenses/odbl/1-0/", "docs": "https://api.adsb.lol/docs", "used_by": "live.py"}
 ]

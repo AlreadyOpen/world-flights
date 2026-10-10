@@ -1,32 +1,23 @@
-# pipeline-template
+# world-flights
 
-The starting point for an [AlreadyOpen](https://github.com/AlreadyOpen) pipeline: a GitHub Action that bakes public data and
-publishes it to a Hugging Face dataset (versioned, for data tools) and bucket (overwritten in place, read by browsers with CORS
-and HTTP Range). Used by hk-transit, hk-buildings and world-skylines; `manifest.py`, `check.py` and `check.yml` are identical in
-all of them, so fix them here and copy them out.
-
-## Start a pipeline
-
-1. **Use this template** on GitHub, name the repo after its data (e.g. `hk-parking`).
-2. `sources.json`: every source with its owner, URL, licence link and the script that reads it.
-3. `bake.py`: write the outputs into `data/out/` and `index.json` with `built` and `counts`.
-4. `publish.py`: set `REPO`, `DATASET_FILES` and `BUCKET_FILES`. One file per source licence: never merge data under different
-   terms into one file.
-5. `hf/README.md`: the dataset card, crediting every owner in `sources.json` (`check.py` fails otherwise).
-6. `publish.py`: set `KAGGLE` (`helenkwok/<repo>` and a 6-50 character title). The Kaggle mirror takes everything published.
-7. `python check.py`, then set both secrets from their files (never echo a token):
-   `gh secret set HF_TOKEN -R AlreadyOpen/<repo> < "$HOME/Library/Application Support/alreadyopen/hf-write.key"` and
-   `gh secret set KAGGLE_API_TOKEN -R AlreadyOpen/<repo> < "$HOME/.kaggle/access_token"`. Add a schedule to
-   `.github/workflows/bake.yml` and run it once by hand.
-
-## What comes with it
+An [AlreadyOpen](https://github.com/AlreadyOpen) pipeline: adsb.lol's daily global ADS-B history as GeoParquet (every point,
+every field) plus a browser replay file, and Hong Kong near-live snapshots every 15 minutes. Published to the Hugging Face
+dataset and bucket `alreadyopen/world-flights` (card: `hf/README.md`), mirrored to Kaggle `helenkwok/world-flights` (latest day
+plus index). Data: adsb.lol contributors, ODbL 1.0.
 
 | File | Does |
 |---|---|
-| `manifest.py` | `manifest.json`: sha256 and size of every published file, the counts, the sources. The publish gate refuses (before any upload) when a count drops > 10%, a count or file disappears, or a file is empty; a manual run's **force** box overrides it |
-| `check.py`, `check.yml` | On every push, no data and no token: scripts compile, `sources.json` is complete, the card credits every owner and has `license_link`, the gate's self-test passes |
-| `kaggle_mirror.py` | After publish, uploads everything published to a public Kaggle dataset (`helenkwok/<repo>`), keeping folders (zipped, Kaggle unpacks them). Own step, allowed to fail. Kaggle cannot pull from Hugging Face itself: its Remote URL refuses HF's 302 redirects |
-| `bake.yml` | Pinned action SHAs; the download cache saved even when publish fails; a keep-alive commit (schedules stop after 60 days without commits) rebased before pushing |
+| `bake.py` | Latest `planes-readsb-prod-0` release of `adsblol/globe_history_<year>`: streams the split tar (curl into `tarfile`), one NDJSON batch of about 1 GB at a time into DuckDB (6 GB memory cap), writes `v/<D>/traces-NNN.parquet` and `v/<D>/replay.bin`, then `index.json` (all days, read back from the bucket) and `latest.json`. `python3 bake.py <tag>` bakes another release, e.g. a small `...-mlatonly-0` for a local test |
+| `publish.py` | The new day to the dataset (one commit) and the bucket; days older than the newest 30 leave the bucket only |
+| `live.py`, `live.yml` | Every 15 minutes: one API call (250 nm around Hong Kong), `live/hk.json` and `live/hk-<UTC day>.parquet` on the bucket; a 429 or error skips the run |
+| `bake.yml` | Daily at 04:30 UTC (adsb.lol publishes about 03:26 UTC); frees runner disk first |
+
+Measured on 2026-10-09 data: the mlat-only release (42,187 aircraft, 10.1M points) bakes in 20 s locally; the first 300 MB of
+the prod release held 7,847 aircraft and 10.6M points (442 MB Parquet). A full prod day is about 4.1 GB of tar, ~26 GB of JSON,
+~150M points, ~6 GB of Parquet and ~0.7 GB of replay (estimates scaled from that sample).
+
+Built from [pipeline-template](https://github.com/AlreadyOpen/pipeline-template); `manifest.py`, `check.py`, `check.yml`
+and `kaggle_mirror.py` are its shared files.
 
 ## Lessons (each cost a failed run once)
 
