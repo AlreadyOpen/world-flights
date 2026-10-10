@@ -2,17 +2,16 @@
 Bucket (overwritten in place):  live/hk.json               the latest response as received, every field
                                 live/hk-YYYY-MM-DD.parquet  that UTC day's snapshots so far, appended each run (GeoParquet: one row
                                                             per aircraft per snapshot, `aircraft` = the full API object as JSON)
-On the first run of a UTC day, the previous day's file (now complete) is committed to the dataset, where it stays, and bucket
-files older than KEEP_DAYS are removed from the bucket. On a 429 or any API error the run is skipped: no retry loop.
+The daily bake copies each complete day into that day's Kaggle dataset; publish.py removes it from the bucket after HF_DAYS,
+once Kaggle lists it. On a 429 or any API error the run is skipped: no retry loop.
 Needs HF_TOKEN. Usage: python3 live.py"""
 import datetime, json, os, sys, tempfile, urllib.request
 import duckdb
-from huggingface_hub import HfApi, batch_bucket_files, download_bucket_files, list_bucket_tree
+from huggingface_hub import batch_bucket_files, download_bucket_files
 
 URL = 'https://api.adsb.lol/v2/point/22.3/114.2/250'
 UA = {'User-Agent': 'AlreadyOpen world-flights (https://github.com/AlreadyOpen/world-flights)'}
 REPO = 'alreadyopen/world-flights'
-KEEP_DAYS = 30
 ROWS = """
 SELECT to_timestamp((j->>'now')::BIGINT / 1000) AS "snapshot", j->>'msg' AS "msg", (j->>'total')::INTEGER AS "total",
   (j->>'ctime')::BIGINT AS "ctime", (j->>'ptime')::BIGINT AS "ptime",
@@ -49,21 +48,13 @@ def main():
     w = tempfile.mkdtemp()
     snap, old, out = os.path.join(w, 'hk.json'), os.path.join(w, 'old.parquet'), os.path.join(w, 'new.parquet')
     open(snap, 'wb').write(body)
-    on_bucket = {f.path for f in list_bucket_tree(REPO, prefix='live', recursive=True) if f.type == 'file'}
-    if name in on_bucket: download_bucket_files(REPO, [(name, old)], raise_on_missing_files=True)
+    download_bucket_files(REPO, [(name, old)], raise_on_missing_files=False)   # absent on the day's first run
+    have = os.path.exists(old)
     con = duckdb.connect(); con.execute('INSTALL spatial; LOAD spatial')
-    append(con, snap, old if name in on_bucket else None, out)
+    append(con, snap, old if have else None, out)
     rows = con.execute(f"SELECT count(*), count(DISTINCT snapshot) FROM '{out}'").fetchone()
-    drop = []
-    if name not in on_bucket:                                          # first run of a UTC day
-        prev = f'live/hk-{day - datetime.timedelta(days=1)}.parquet'
-        if prev in on_bucket:
-            p = os.path.join(w, 'prev.parquet'); download_bucket_files(REPO, [(prev, p)], raise_on_missing_files=True)
-            HfApi().upload_file(path_or_fileobj=p, path_in_repo=prev, repo_id=REPO, repo_type='dataset', commit_message=f'{prev}: complete day')
-        cut = f'live/hk-{day - datetime.timedelta(days=KEEP_DAYS)}.parquet'
-        drop = sorted(f for f in on_bucket if f.startswith('live/hk-') and f.endswith('.parquet') and f < cut)
-    batch_bucket_files(REPO, add=[(snap, 'live/hk.json'), (out, name)], delete=drop or None)
-    print(json.dumps({'snapshot': d['now'], 'aircraft': len(d['ac']), 'file': name, 'rows': rows[0], 'snapshots': rows[1], 'dropped': drop}))
+    batch_bucket_files(REPO, add=[(snap, 'live/hk.json'), (out, name)])
+    print(json.dumps({'snapshot': d['now'], 'aircraft': len(d['ac']), 'file': name, 'rows': rows[0], 'snapshots': rows[1]}))
 
 
 if __name__ == '__main__':

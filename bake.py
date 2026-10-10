@@ -12,7 +12,11 @@ Outputs (sources.OUT):
   v/<D>/acas.parquet        raw/acas/acas.json.gz (one ACAS resolution advisory per line: readsb's aircraft object plus
                             `acas_ra`) as GeoParquet, every field (`record` = the whole line as JSON)
   v/<D>/raw/...             the release's non-trace files as delivered (heatmap/NN.bin.ttf is not parsed: see the card)
+  v/<D>/live/hk-<D>.parquet the day's Hong Kong snapshots (live.py), copied from the bucket
+  v/<D>/index.json          the day's entry (becomes the Kaggle day dataset's index)
   index.json                every day baked so far (read back from the bucket), latest.json the newest day
+Where they go: everything in v/<D>/ to the Kaggle day dataset (kaggle_archive.py); traces and replay to the HF bucket for
+HF_DAYS days (publish.py)
 Usage: python3 bake.py [<release tag>]   (default: the latest prod-0 release; e.g. a ...-mlatonly-0 tag for a small test)"""
 import datetime, gzip, json, os, re, shutil, subprocess, sys, tarfile, urllib.error, urllib.request
 import duckdb, numpy as np
@@ -20,9 +24,9 @@ import sources
 
 BATCH = 1 << 30                                   # bytes of trace JSON per Parquet part
 STEP = 30                                         # replay: first position in each 30 s bucket per aircraft
-KEEP_ON_BUCKET = 30                               # days on the bucket; the dataset keeps every day
+HF_DAYS = 7                                       # days of traces and replay on the HF bucket; Kaggle keeps every day
 REPO = 'alreadyopen/world-flights'
-DS = f'https://huggingface.co/datasets/{REPO}/resolve/main/'
+KG = 'https://www.kaggle.com/datasets/helenkwok/world-flights-'
 BK = f'https://huggingface.co/buckets/{REPO}/resolve/'
 UA = {'User-Agent': 'AlreadyOpen world-flights (https://github.com/AlreadyOpen/world-flights)'}
 REPLAY = """little-endian: b'AOR1', uint32 header length H, H bytes of JSON header (padded to 4), then N values per column in
@@ -126,7 +130,7 @@ def main(tag=None):
     tag, day, urls = release(tag)
     idx = previous_index()
     if any(d['day'] == day for d in idx['days']) and not os.environ.get('BAKE_AGAIN'):
-        print(f'{day} is already baked; nothing new'); idx['new'] = []
+        print(f'{day} is already baked; nothing new'); idx['new'], idx['new_day'] = [], None
         os.makedirs(sources.OUT, exist_ok=True); json.dump(idx, open(os.path.join(sources.OUT, 'index.json'), 'w'), indent=1)
         return
     rel = f'v/{day}'; day_dir = os.path.join(sources.OUT, rel); work = os.path.join(sources.CACHE, 'work')
@@ -163,24 +167,28 @@ def main(tag=None):
     if os.path.exists(acas) and os.path.getsize(acas) > 20:                  # an empty gzip is 20 bytes (the mlat-only release)
         con.execute(f"COPY ({ACAS.format(src=acas)} ORDER BY 1) TO '{day_dir}/acas.parquet' (FORMAT parquet, COMPRESSION zstd)")
         acas_events = con.execute(f"SELECT count(*) FROM '{day_dir}/acas.parquet'").fetchone()[0]
+    hk = os.path.join(day_dir, 'live', f'hk-{day}.parquet'); os.makedirs(os.path.dirname(hk))   # live.py's day, complete by now
+    try: urllib.request.urlretrieve(BK + f'live/hk-{day}.parquet', hk)
+    except urllib.error.HTTPError as e:
+        if e.code not in (401, 404): raise
+        os.rmdir(os.path.dirname(hk)); print(f'no Hong Kong snapshots for {day}')
     con.close(); shutil.rmtree(work)
     prev = [d for d in idx['days'] if d['day'] < day]
     if prev and tag.endswith('-prod-0') and points < prev[-1]['points'] * 0.5:
         sys.exit(f'{day}: {points} points, under half of {prev[-1]["day"]} ({prev[-1]["points"]}): a broken release?')
-    names = sorted(os.path.relpath(os.path.join(r, f), day_dir) for r, _, fs in os.walk(day_dir) for f in fs)
-    entry = {'day': day, 'release': tag, 'source': urls, 'aircraft': aircraft, 'points': points, 'replay_points': replay_points, 'acas_events': acas_events,
-             'files': names, 'bytes': sum(os.path.getsize(os.path.join(day_dir, f)) for f in names),
-             'dataset': [DS + f'{rel}/{f}' for f in names], 'bucket': [BK + f'{rel}/{f}' for f in names]}
+    names = sorted(os.path.relpath(os.path.join(r, f), day_dir) for r, _, fs in os.walk(day_dir) for f in fs) + ['index.json']
+    on_bucket = [f for f in names if f.startswith(('traces-', 'replay/'))]          # what the map needs; the rest is on Kaggle only
+    entry = {'day': day, 'release': tag, 'source': urls, 'aircraft': aircraft, 'points': points, 'replay_points': replay_points,
+             'acas_events': acas_events, 'files': names, 'bytes': sum(os.path.getsize(os.path.join(day_dir, f)) for f in names[:-1]),
+             'kaggle': KG + day, 'bucket_files': on_bucket, 'bucket': [BK + f'{rel}/{f}' for f in on_bucket]}
+    json.dump(entry, open(os.path.join(day_dir, 'index.json'), 'w'), indent=1)       # the day dataset's own index
     days = sorted([d for d in idx['days'] if d['day'] != day] + [entry], key=lambda d: d['day'])
-    dropped = []
-    for d in days[:-KEEP_ON_BUCKET]:                                   # older days: dataset only (nothing is deleted there)
-        if d.get('bucket'): dropped += [f"v/{d['day']}/{f}" for f in d['files']]; d['bucket'] = None
-    new = [f'{rel}/{f}' for f in names]
     idx = {'built': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
            'counts': {'days': len(days), 'aircraft': sum(d['aircraft'] for d in days), 'points': sum(d['points'] for d in days)},
-           'licence': 'ODbL 1.0, adsb.lol contributors', 'expected_daily_volume': EXPECTED_DAILY, 'replay_layout': REPLAY, 'days': days, 'new': new, 'bucket_drop': dropped}
+           'licence': 'ODbL 1.0, adsb.lol contributors', 'hf_days': HF_DAYS, 'expected_daily_volume': EXPECTED_DAILY,
+           'replay_layout': REPLAY, 'days': days, 'new_day': day, 'new': [f'{rel}/{f}' for f in on_bucket]}
     json.dump(idx, open(os.path.join(sources.OUT, 'index.json'), 'w'), indent=1)
-    json.dump({k: entry[k] for k in ('day', 'aircraft', 'points', 'replay_points', 'acas_events', 'dataset', 'bucket')} | {'index': BK + 'index.json'},
+    json.dump({k: entry[k] for k in ('day', 'aircraft', 'points', 'replay_points', 'acas_events', 'kaggle', 'bucket')} | {'index': BK + 'index.json'},
               open(os.path.join(sources.OUT, 'latest.json'), 'w'), indent=1)
     print(json.dumps({'day': day, 'aircraft': aircraft, 'points': points, 'replay_points': replay_points, 'acas_events': acas_events, 'bytes': entry['bytes']}))
 

@@ -1,5 +1,8 @@
 # Daily bake and publish (bake.py, publish.py). adsb.lol publishes the previous UTC day's prod-0 release at about 03:26 UTC
-# (published_at of the 2026-09 and 2026-10 releases), so this runs at 04:30 UTC. Nothing new: publish and the mirror do nothing.
+# (published_at of the 2026-09 and 2026-10 releases), so this runs at 04:30 UTC. Nothing new: every later step does nothing.
+# Order: bake -> Kaggle archive (the day's own dataset, verified) -> Hugging Face (adds the day; removes days older than
+# HF_DAYS only once Kaggle lists today's and their datasets). A failed archive still publishes the day to HF, removes nothing.
+# Re-bake a day (e.g. one whose archive failed; GitHub keeps adsb.lol's releases): run by hand with its tag.
 # Each run commits status/last-run.json: GitHub turns schedules off after 60 days with no commits (live.yml relies on it too).
 name: bake
 on:
@@ -11,6 +14,10 @@ on:
         description: 'Publish even if the publish gate finds a count drop (a real drop, checked by hand)'
         type: boolean
         default: false
+      tag:
+        description: 'adsb.lol release tag to bake again (empty = the latest prod-0)'
+        type: string
+        default: ''
 permissions:
   contents: write
 concurrency:
@@ -38,19 +45,22 @@ jobs:
       - name: bake
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python bake.py
-      - name: publish
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          PUBLISH_FORCE: ${{ inputs.force && '1' || '0' }}
-        run: set -o pipefail; mkdir -p status && python publish.py | tee status/last-run.json   # git keeps no empty folder: mkdir first
-      # Kaggle mirror of the latest day + index (Helen's account). Its own step, allowed to fail: never blocks Hugging Face.
-      - name: mirror to Kaggle
+          TAG: ${{ inputs.tag }}
+          BAKE_AGAIN: ${{ inputs.tag }}
+        run: python bake.py $TAG
+      # the archive: one public Kaggle dataset per day, created once, never versioned or deleted. Allowed to fail: publish then
+      # adds the day to HF but removes nothing.
+      - name: archive to Kaggle
         continue-on-error: true
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-        run: |
-          if [ -f data/out/latest.json ]; then python kaggle_mirror.py; else echo 'nothing new to mirror'; fi
+        run: python kaggle_archive.py
+      - name: publish
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          PUBLISH_FORCE: ${{ inputs.force && '1' || '0' }}
+        run: set -o pipefail; mkdir -p status && python publish.py | tee status/last-run.json   # git keeps no empty folder: mkdir first
       - name: keep-alive commit
         run: |
           git config user.name 'github-actions[bot]'
