@@ -7,7 +7,7 @@ once Kaggle lists it. On a 429 or any API error the run is skipped: no retry loo
 Needs HF_TOKEN. Usage: python3 live.py"""
 import datetime, json, os, sys, tempfile, urllib.request
 import duckdb
-from huggingface_hub import batch_bucket_files, download_bucket_files
+from huggingface_hub import batch_bucket_files, create_bucket, download_bucket_files
 
 URL = 'https://api.adsb.lol/v2/point/22.3/114.2/250'
 UA = {'User-Agent': 'AlreadyOpen world-flights (https://github.com/AlreadyOpen/world-flights)'}
@@ -48,6 +48,7 @@ def main():
     w = tempfile.mkdtemp()
     snap, old, out = os.path.join(w, 'hk.json'), os.path.join(w, 'old.parquet'), os.path.join(w, 'new.parquet')
     open(snap, 'wb').write(body)
+    create_bucket(REPO, private=False, exist_ok=True)                    # the first snapshot may run before the first bake
     download_bucket_files(REPO, [(name, old)], raise_on_missing_files=False)   # absent on the day's first run
     have = os.path.exists(old)
     con = duckdb.connect(); con.execute('INSTALL spatial; LOAD spatial')
