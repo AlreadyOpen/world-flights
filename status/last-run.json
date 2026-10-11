@@ -1,1 +1,1 @@
-{"bucket": "https://huggingface.co/buckets/alreadyopen/world-flights", "day": "2026-10-09", "built": "2026-10-10T13:21:51+00:00", "counts": {"days": 1, "aircraft": 81756, "points": 114147647}, "removed_from_bucket": 0}
+{"bucket": "https://huggingface.co/buckets/alreadyopen/world-flights", "day": "2026-10-10", "built": "2026-10-11T11:02:06+00:00", "counts": {"days": 2, "aircraft": 149227, "points": 210811397}, "removed_from_bucket": 0}
