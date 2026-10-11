@@ -3,7 +3,7 @@
 name: live
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '11,26,41,56 * * * *'   # every 15 min, off the busy top of the hour (GitHub delays or drops schedules at :00 under load)
   workflow_dispatch:
 permissions:
   contents: read
