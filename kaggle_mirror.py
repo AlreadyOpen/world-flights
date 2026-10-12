@@ -9,7 +9,50 @@ a folder is uploaded as a zip that Kaggle unpacks again (Kaggle allows only 50 t
 ask Helen first.
 Usage: python3 kaggle_mirror.py                                  (reads REPO, DATASET_FILES, BUCKET_FILES, KAGGLE from publish.py)
        python3 kaggle_mirror.py <owner/slug> "<title>" <root> <path>...  (paths relative to root)"""
-import json, os, re, subprocess, sys, tempfile
+import csv, io, json, os, re, subprocess, sys, tempfile, time
+from datetime import datetime, timedelta, timezone
+
+def local_files(d):
+    """every file under the upload folder (symlinks followed), as Kaggle lists it: relative path -> bytes"""
+    out = {}
+    for top, _, names in os.walk(d, followlinks=True):
+        for n in names:
+            p = os.path.join(top, n)
+            if os.path.relpath(p, d) != 'dataset-metadata.json':
+                out[os.path.relpath(p, d)] = os.path.getsize(p)
+    return out
+
+def missing(slug, files, since):
+    """'' when Kaggle has the dataset ready, updated since `since` (UTC) and holding every file at its size; else why not"""
+    run = lambda *a: subprocess.run(['kaggle', 'datasets', *a], capture_output=True, text=True)
+    if run('status', slug).stdout.strip() != 'ready':
+        return 'not ready'
+    owner, name = slug.split('/')
+    rows = csv.DictReader(io.StringIO(run('list', '-s', name, '--user', owner, '--csv').stdout))
+    updated = next((r['lastUpdated'] for r in rows if r['ref'] == slug), '')
+    if updated[:19] < since:
+        return f'last updated {updated or "never"}, before this upload'
+    have, token = {}, None
+    while True:                                                            # Kaggle lists 200 files per page
+        lines = run('files', slug, '--page-size', '200', '--csv', *(['--page-token', token] if token else [])).stdout.splitlines()
+        token = lines.pop(0).split('=', 1)[1].strip() if lines and lines[0].startswith('Next Page Token') else None
+        have |= {r['name']: int(r['size']) for r in csv.DictReader(io.StringIO('\n'.join(lines)))}
+        if not token:
+            break
+    bad = sorted(f for f, n in files.items() if have.get(f) != n)
+    return f'{len(bad)} of {len(files)} files missing or another size, e.g. {bad[:3]}' if bad else ''
+
+def landed(slug, files, since, wait=600):
+    """after the CLI exits non-zero: Kaggle sometimes answers with a broken reply although the upload went through
+    (world-buildings-nl, 2026-10-11). Success only if every file is there at its size within `wait` seconds."""
+    deadline = time.time() + wait
+    while why := missing(slug, files, since):
+        if time.time() > deadline:
+            print(f'kaggle: upload not complete after {wait} s: {why}', file=sys.stderr)
+            return False
+        time.sleep(30)
+    print('kaggle: the CLI reported an error, but every file landed', file=sys.stderr)
+    return True
 
 def card_body():
     t = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hf', 'README.md'), encoding='utf-8').read()
@@ -29,7 +72,9 @@ def mirror(slug, title, root, paths):
             cmd = ['kaggle', 'datasets', 'version', '-p', d, '-m', os.environ.get('KAGGLE_MESSAGE', 'update'), '-t', '-q', *mode]
         else:
             cmd = ['kaggle', 'datasets', 'create', '-p', d, '--public', '-t', '-q', *mode]
-        subprocess.run(cmd, check=True)
+        since = (datetime.now(timezone.utc) - timedelta(minutes=2)).strftime('%Y-%m-%d %H:%M:%S')   # clock skew
+        if subprocess.run(cmd).returncode and not landed(slug, local_files(d), since):
+            sys.exit(1)
     print(json.dumps({'kaggle': f'https://www.kaggle.com/datasets/{slug}', 'paths': sorted({p.split('/')[0] for p in paths}),
                       'versioned' if exists else 'created': True}))
 
